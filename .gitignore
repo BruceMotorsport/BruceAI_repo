@@ -1,0 +1,10 @@
+# Secrets stay local - never committed
+.env
+
+# Vendored side project - not part of the server
+deerflow/
+
+# Runtime output
+logs/
+__pycache__/
+*.pyc

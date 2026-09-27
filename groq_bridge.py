@@ -34,9 +34,17 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 import uvicorn
 import httpx
+
+try:
+    from env_loader import load_dotenv
+except ImportError:
+    def load_dotenv(*_args, **_kwargs):
+        return {}
+
+load_dotenv()
 
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────
@@ -56,11 +64,15 @@ DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 # ─── MODELS ──────────────────────────────────────────────────────────────
 class Message(BaseModel):
+    model_config = ConfigDict(extra="allow")
     role: str
-    content: str
+    content: Optional[Any] = None
     name: Optional[str] = None
+    tool_calls: Optional[List[Any]] = None
+    tool_call_id: Optional[str] = None
 
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     model: str
     messages: List[Message]
     temperature: Optional[float] = 0.7
@@ -70,6 +82,8 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = 0.0
     presence_penalty: Optional[float] = 0.0
     stop: Optional[List[str]] = None
+    tools: Optional[List[Any]] = None
+    tool_choice: Optional[Any] = None
 
 class ModelInfo(BaseModel):
     id: str
@@ -122,11 +136,19 @@ class GroqClient:
         async with self.client.stream("POST", "/chat/completions", json=payload) as resp:
             if resp.status_code >= 400:
                 body = await resp.aread()
-                raise HTTPException(status_code=resp.status_code, detail=body.decode())
+                detail = body.decode(errors="replace")
+                print(f"[groq_bridge] upstream {resp.status_code} on stream: {detail[:500]}", flush=True)
+                err = json.dumps({"error": {"message": detail[:500], "type": "upstream_error", "code": resp.status_code}})
+                yield f"data: {err}\n\n"
+                yield "data: [DONE]\n\n"
+                return
             
             async for line in resp.aiter_lines():
                 if line.strip():
-                    yield f"data: {line}\n\n"
+                    if line.startswith("data:") or line.startswith("event:"):
+                        yield f"{line}\n\n"
+                    else:
+                        yield f"data: {line}\n\n"
             yield "data: [DONE]\n\n"
     
     async def list_models(self) -> List[ModelInfo]:
