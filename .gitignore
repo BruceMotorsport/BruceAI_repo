@@ -1,5 +1,7 @@
 # Secrets stay local - never committed
 .env
+.env.*
+groq_keys.txt
 
 # Vendored side project - not part of the server
 deerflow/
@@ -8,3 +10,10 @@ deerflow/
 logs/
 __pycache__/
 *.pyc
+pool_cache.db
+
+# Local answer library (contains conversation text)
+state/
+
+# Nested clone used for publishing
+bruceai_repo/

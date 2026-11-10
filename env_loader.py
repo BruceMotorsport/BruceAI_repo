@@ -37,6 +37,27 @@ def is_placeholder(value: str | None) -> bool:
     return any(tok in low for tok in _PLACEHOLDER_TOKENS)
 
 
+def sanitize_proxy_env() -> None:
+    """Drop NO_PROXY entries that httpx cannot parse (IPv6 literals such as [::1]).
+
+    httpx 0.28 treats every NO_PROXY entry as a URL pattern, so a value like
+    ``localhost,127.0.0.1,[::1],::1`` makes ``httpx.AsyncClient()`` raise
+    ``InvalidURL: Invalid port: ':1]'`` before any request is made.  These
+    services talk to loopback and public HTTPS hosts only, so the IPv6
+    no-proxy entries carry no value and can be removed safely.
+    """
+    for var in ("NO_PROXY", "no_proxy"):
+        raw = os.environ.get(var)
+        if not raw:
+            continue
+        keep = [
+            entry
+            for entry in (part.strip() for part in raw.split(","))
+            if entry and ":" not in entry and "[" not in entry
+        ]
+        os.environ[var] = ",".join(keep)
+
+
 def _parse(path: Path) -> dict:
     out = {}
     try:
