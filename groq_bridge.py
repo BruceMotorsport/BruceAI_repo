@@ -212,7 +212,9 @@ class GroqClient:
             timeout=120.0,
         )
         self.cf = None
-        if CLOUDFLARE_API_KEY and CLOUDFLARE_AI_BASE:
+        # Cloudflare's free 10k neurons/day do not survive an agentic burst;
+        # POOL_CF_FALLBACK=0 keeps it out of the fallback chain entirely.
+        if CLOUDFLARE_API_KEY and CLOUDFLARE_AI_BASE and os.environ.get("POOL_CF_FALLBACK", "1") == "1":
             self.cf = httpx.AsyncClient(
                 base_url=CLOUDFLARE_AI_BASE,
                 headers={

@@ -26,12 +26,21 @@ _FALLBACK_KEYS = ("GROQ_API_KEY", "OPENROUTER_API_KEY")
 
 _PLACEHOLDER_TOKENS = ("<", ">", "your_", "changeme", "placeholder", "test_key", "dummy")
 
+# Complete at one character: feature switches (POOL_CF_FALLBACK=0, POOL_MS_THINKING=1).
+# The 12-char floor below is a heuristic for mistyped keys, and it was silently
+# swallowing every short switch in .env.
+_SHORT_VALID = frozenset({"0", "1", "true", "false", "yes", "no", "on", "off"})
+
 
 def is_placeholder(value: str | None) -> bool:
     if value is None:
         return True
     v = value.strip()
-    if not v or len(v) < 12:
+    if not v:
+        return True
+    if v.lower() in _SHORT_VALID:
+        return False
+    if len(v) < 12:
         return True
     low = v.lower()
     return any(tok in low for tok in _PLACEHOLDER_TOKENS)
