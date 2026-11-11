@@ -43,14 +43,6 @@ OPENCODE_KEY = os.getenv("OPENCODE_KEY")
 SUPER_SOLDIER_URL = os.getenv("SUPER_SOLDIER_URL", "http://127.0.0.1:8082/process")
 SUPER_SOLDIER_GROQ_MODEL = os.getenv("SUPER_SOLDIER_GROQ_MODEL", "openai/gpt-oss-120b")
 SUPER_SOLDIER_TASK_LIMIT = int(os.getenv("SUPER_SOLDIER_TASK_LIMIT", "10000"))
-# Local ColiBRI engine (coli serve). OpenAI-compatible, full tool-calling
-# pass-through - see ~/.bruceai/config.yaml for the provider entry.
-COLIBRI_URL = os.getenv("COLIBRI_URL", "http://127.0.0.1:9002/v1")
-# coli serve 404s any id that isn't the one it reports in /models, so the id
-# is resolved from the engine (colibri_model_id) rather than hardcoded.
-COLIBRI_MODEL_ID = os.getenv("COLIBRI_MODEL_ID", "qwen3.6-colibri")
-_colibri_id_state = {"id": COLIBRI_MODEL_ID, "at": 0.0}
-_COLIBRI_ID_TTL = int(os.getenv("COLIBRI_ID_TTL", "600"))
 
 # OpenCode free-tier models. The picker lists these (free only) instead of one
 # generic "opencode" entry; refreshed from `opencode models`, which is also the
@@ -100,9 +92,6 @@ MODEL_ROUTES = {
     "whisper-large-v3-turbo": "groq",
     "openai/gpt-oss-120b": "groq",
     "super-soldier": "supersoldier",
-    # Local ColiBRI engine (coli serve on :9002)
-    "colibri": "colibri",
-    "qwen3.6-colibri": "colibri",
     # OpenCode models -> subprocess
     "opencode": "opencode",
     "opencode-zen": "opencode",
@@ -190,37 +179,6 @@ def get_route(model: str) -> str:
         return "opencode"
     return "openrouter"
 
-def colibri_base_url() -> str:
-    """Engine root (no /v1): /health and the dashboard live there."""
-    return COLIBRI_URL[:-3] if COLIBRI_URL.endswith("/v1") else COLIBRI_URL
-
-async def colibri_model_id() -> str:
-    """Ask the engine what it calls itself. A stale id comes back as a bare
-    HTTP 404 (no body), which reads as a crash to callers."""
-    now = time.time()
-    if now - float(_colibri_id_state["at"]) > _COLIBRI_ID_TTL:
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(f"{COLIBRI_URL}/models")
-                if resp.status_code == 200:
-                    data = resp.json().get("data") or []
-                    if data and data[0].get("id"):
-                        _colibri_id_state["id"] = data[0]["id"]
-                        _colibri_id_state["at"] = now
-        except (httpx.HTTPError, ValueError):
-            pass
-    return str(_colibri_id_state["id"])
-
-async def colibri_status() -> str:
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            resp = await client.get(f"{colibri_base_url()}/health")
-            if resp.status_code == 200:
-                return "healthy"
-            return f"degraded ({resp.status_code})"
-    except httpx.HTTPError as e:
-        return f"unreachable ({e.__class__.__name__})"
-
 # Super-Soldier is an unfinished side project. It is only advertised and
 # routed while its own gateway is answering, so a half-built service can never
 # show up in the picker as if it were a working model.
@@ -271,8 +229,6 @@ async def health():
         "status": "ok",
         "port": 9001,
         "groq_bridge": groq_status,
-        "colibri": await colibri_status(),
-        "colibri_model": await colibri_model_id(),
         "super_soldier": await supersoldier_status(),
         "openrouter_configured": bool(OPENROUTER_API_KEY),
         "opencode_configured": bool(OPENCODE_KEY)
@@ -312,9 +268,6 @@ async def list_models():
     if await supersoldier_available():
         models.append(Model(id="super-soldier", owned_by="bruceai"))
 
-    # Local ColiBRI engine (coli serve, :9002)
-    models.append(Model(id=await colibri_model_id(), owned_by="colibri"))
-    
     # OpenRouter models (common ones)
     openrouter_models = [
         "anthropic/claude-3.5-sonnet",
@@ -568,53 +521,6 @@ async def call_supersoldier(request: ChatCompletionRequest):
         "supersoldier": {"provider": data.get("provider"), "latency": data.get("latency")},
     }
 
-async def call_colibri(request: ChatCompletionRequest, authorization: Optional[str]):
-    """Local ColiBRI engine (coli serve). Full pass-through: messages, tools,
-    tool_choice and streaming all reach the engine untouched, so agent clients
-    (Hermes) keep their entire tool loop on this model."""
-    headers = {"Content-Type": "application/json"}
-    if authorization:
-        headers["Authorization"] = authorization
-
-    payload = request.model_dump(exclude_none=True)
-    for _m in payload.get("messages", []):
-        if isinstance(_m, dict):
-            for _k in ("reasoning_details", "reasoning", "reasoning_content", "reasoning_tokens"):
-                _m.pop(_k, None)
-    payload["model"] = await colibri_model_id()
-    payload["stream"] = request.stream
-
-    if request.stream:
-        async def stream_response():
-            try:
-                async with httpx.AsyncClient(timeout=600) as client:
-                    async with client.stream("POST", f"{COLIBRI_URL}/chat/completions", json=payload, headers=headers) as resp:
-                        if resp.status_code != 200:
-                            body = (await resp.aread()).decode("utf-8", "replace")
-                            yield f"data: {json.dumps({'error': {'message': body, 'type': 'upstream_error', 'code': resp.status_code}})}\n\n"
-                            yield "data: [DONE]\n\n"
-                            return
-                        async for line in resp.aiter_lines():
-                            if line:
-                                yield f"{line}\n\n"
-            except httpx.HTTPError as exc:
-                # Engine down mid-stream: report it instead of dropping the
-                # socket, so the caller retries this provider rather than
-                # falling through to a rate-limited pool.
-                msg = f"colibri unreachable at {COLIBRI_URL}: {exc.__class__.__name__}: {exc}"
-                yield f"data: {json.dumps({'error': {'message': msg, 'type': 'upstream_error', 'code': 503}})}\n\n"
-                yield "data: [DONE]\n\n"
-        return StreamingResponse(stream_response(), media_type="text/event-stream")
-    else:
-        try:
-            async with httpx.AsyncClient(timeout=600) as client:
-                resp = await client.post(f"{COLIBRI_URL}/chat/completions", json=payload, headers=headers)
-        except httpx.HTTPError as exc:
-            raise HTTPException(503, f"colibri unreachable at {COLIBRI_URL}: {exc.__class__.__name__}: {exc}")
-        if resp.status_code != 200:
-            raise HTTPException(resp.status_code, resp.text)
-        return resp.json()
-
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, authorization: Optional[str] = Header(None)):
     route = get_route(request.model)
@@ -634,8 +540,6 @@ async def chat_completions(request: ChatCompletionRequest, authorization: Option
                 f"{await supersoldier_status()} at {SUPER_SOLDIER_URL}",
             )
         return await call_supersoldier(request)
-    elif route == "colibri":
-        return await call_colibri(request, authorization)
     else:
         raise HTTPException(400, f"Unknown route for model: {request.model}")
 
