@@ -667,6 +667,12 @@ class KeyPool:
         req = KeyPool._cf_request(payload, ms_model)
         if not MS_THINKING:
             req["enable_thinking"] = False
+            # Clients that expose a reasoning dial (Hermes, some SDKs) send
+            # reasoning_effort. ModelScope rejects it alongside
+            # enable_thinking=false (400 "reasoning_effort must be 'none'"),
+            # so pin it to the only value that combination accepts.
+            if "reasoning_effort" in req:
+                req["reasoning_effort"] = "none"
         return req
 
     @staticmethod
