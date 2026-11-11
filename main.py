@@ -221,6 +221,36 @@ async def colibri_status() -> str:
     except httpx.HTTPError as e:
         return f"unreachable ({e.__class__.__name__})"
 
+# Super-Soldier is an unfinished side project. It is only advertised and
+# routed while its own gateway is answering, so a half-built service can never
+# show up in the picker as if it were a working model.
+SUPER_SOLDIER_HEALTH_URL = os.getenv(
+    "SUPER_SOLDIER_HEALTH_URL",
+    SUPER_SOLDIER_URL.replace("/process", "/health"),
+)
+SUPER_SOLDIER_TTL = int(os.getenv("SUPER_SOLDIER_TTL", "60"))
+_supersoldier_state = {"ok": False, "detail": "unchecked", "at": 0.0}
+
+async def supersoldier_status() -> str:
+    now = time.time()
+    if now - float(_supersoldier_state["at"]) > SUPER_SOLDIER_TTL:
+        try:
+            async with httpx.AsyncClient(timeout=2) as client:
+                resp = await client.get(SUPER_SOLDIER_HEALTH_URL)
+            _supersoldier_state["ok"] = resp.status_code < 400
+            _supersoldier_state["detail"] = (
+                "healthy" if _supersoldier_state["ok"] else f"degraded ({resp.status_code})"
+            )
+        except httpx.HTTPError as e:
+            _supersoldier_state["ok"] = False
+            _supersoldier_state["detail"] = f"unreachable ({e.__class__.__name__})"
+        _supersoldier_state["at"] = now
+    return str(_supersoldier_state["detail"])
+
+async def supersoldier_available() -> bool:
+    await supersoldier_status()
+    return bool(_supersoldier_state["ok"])
+
 @app.get("/health")
 async def health():
     # Check Groq bridge connectivity
@@ -243,6 +273,7 @@ async def health():
         "groq_bridge": groq_status,
         "colibri": await colibri_status(),
         "colibri_model": await colibri_model_id(),
+        "super_soldier": await supersoldier_status(),
         "openrouter_configured": bool(OPENROUTER_API_KEY),
         "opencode_configured": bool(OPENCODE_KEY)
     }
@@ -277,8 +308,9 @@ async def list_models():
     for mid in await opencode_free_models():
         models.append(Model(id=mid, owned_by="opencode"))
 
-    # LLM Super-Soldier gateway (local, :8082)
-    models.append(Model(id="super-soldier", owned_by="bruceai"))
+    # LLM Super-Soldier gateway (local, :8082) - only while it is actually up
+    if await supersoldier_available():
+        models.append(Model(id="super-soldier", owned_by="bruceai"))
 
     # Local ColiBRI engine (coli serve, :9002)
     models.append(Model(id=await colibri_model_id(), owned_by="colibri"))
@@ -595,6 +627,12 @@ async def chat_completions(request: ChatCompletionRequest, authorization: Option
     elif route == "opencode":
         return await call_opencode(request)
     elif route == "supersoldier":
+        if not await supersoldier_available():
+            raise HTTPException(
+                503,
+                f"super-soldier is an unfinished project and its gateway is "
+                f"{await supersoldier_status()} at {SUPER_SOLDIER_URL}",
+            )
         return await call_supersoldier(request)
     elif route == "colibri":
         return await call_colibri(request, authorization)
