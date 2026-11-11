@@ -37,6 +37,9 @@ app = FastAPI(title="BruceAI Provider Console", version="1.0")
 
 # Configuration from environment
 GROQ_BRIDGE_URL = os.getenv("GROQ_BRIDGE_URL", "http://127.0.0.1:8080/v1")
+# Qwen's large agent turns exceed Groq's 7k ITPM cap; the pool on :8081 is the
+# only backend that also reaches ModelScope, so Qwen goes there, not to the bridge.
+POOL_URL = os.getenv("POOL_URL", "http://127.0.0.1:8081/v1")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENCODE_KEY = os.getenv("OPENCODE_KEY")
@@ -85,7 +88,9 @@ def opencode_bin() -> Optional[str]:
 # Model routing map
 MODEL_ROUTES = {
     # Groq models -> Groq Bridge (free tier: 8k tokens/min — small payloads only)
-    "qwen/qwen3.8-27b": "groq",
+    # Qwen goes to the pool instead: it has the same Groq keys plus a ModelScope
+    # escape hatch for the 13k+ token turns an agent actually sends.
+    "qwen/qwen3.8-27b": "pool",
     "allam-2-7b": "groq",
     "canopylabs/orpheus-v1-english": "groq",
     "whisper-large-v3": "groq",
@@ -225,10 +230,23 @@ async def health():
     except Exception as e:
         groq_status = f"unreachable ({e})"
     
+    pool_status = "unknown"
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.get(f"{POOL_URL.replace('/v1', '')}/health")
+            if resp.status_code == 200:
+                data = resp.json()
+                pool_status = "healthy" if data.get("status") == "ok" else f"degraded ({data.get('status')})"
+            else:
+                pool_status = f"degraded ({resp.status_code})"
+    except Exception as e:
+        pool_status = f"unreachable ({e.__class__.__name__})"
+    
     return {
         "status": "ok",
         "port": 9001,
         "groq_bridge": groq_status,
+        "qwen_pool": pool_status,
         "super_soldier": await supersoldier_status(),
         "openrouter_configured": bool(OPENROUTER_API_KEY),
         "opencode_configured": bool(OPENCODE_KEY)
@@ -288,7 +306,9 @@ async def list_models():
     
     return ModelsResponse(data=dedupe_models(models))
 
-async def call_groq_bridge(request: ChatCompletionRequest, authorization: Optional[str]):
+async def call_groq_bridge(request: ChatCompletionRequest, authorization: Optional[str],
+                           base_url: Optional[str] = None, timeout: float = 60.0):
+    upstream = base_url or GROQ_BRIDGE_URL
     headers = {"Content-Type": "application/json"}
     if authorization:
         headers["Authorization"] = authorization
@@ -304,8 +324,8 @@ async def call_groq_bridge(request: ChatCompletionRequest, authorization: Option
     
     if request.stream:
         async def stream_response():
-            async with httpx.AsyncClient(timeout=60) as client:
-                async with client.stream("POST", f"{GROQ_BRIDGE_URL}/chat/completions", json=payload, headers=headers) as resp:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream("POST", f"{upstream}/chat/completions", json=payload, headers=headers) as resp:
                     if resp.status_code != 200:
                         body = (await resp.aread()).decode("utf-8", "replace")
                         yield f"data: {json.dumps({'error': {'message': body, 'type': 'upstream_error', 'code': resp.status_code}})}\n\n"
@@ -316,11 +336,16 @@ async def call_groq_bridge(request: ChatCompletionRequest, authorization: Option
                             yield f"{line}\n\n"
         return StreamingResponse(stream_response(), media_type="text/event-stream")
     else:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(f"{GROQ_BRIDGE_URL}/chat/completions", json=payload, headers=headers)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(f"{upstream}/chat/completions", json=payload, headers=headers)
         if resp.status_code != 200:
             raise HTTPException(resp.status_code, resp.text)
         return resp.json()
+
+async def call_pool(request: ChatCompletionRequest, authorization: Optional[str]):
+    # ModelScope can take a while to produce the first byte on a 35k-token turn;
+    # the pool itself waits up to 60 s for headers, so give the hop headroom.
+    return await call_groq_bridge(request, authorization, base_url=POOL_URL, timeout=240.0)
 
 async def call_openrouter(request: ChatCompletionRequest, authorization: Optional[str]):
     if not OPENROUTER_API_KEY:
@@ -528,6 +553,8 @@ async def chat_completions(request: ChatCompletionRequest, authorization: Option
     
     if route == "groq":
         return await call_groq_bridge(request, authorization)
+    elif route == "pool":
+        return await call_pool(request, authorization)
     elif route == "openrouter":
         return await call_openrouter(request, authorization)
     elif route == "opencode":
@@ -552,6 +579,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 9001))
     logger.info(f"Starting Provider Console on port {port}")
     logger.info(f"Groq Bridge: {GROQ_BRIDGE_URL}")
+    logger.info(f"Qwen Pool: {POOL_URL}")
     logger.info(f"OpenRouter: {'configured' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}")
     logger.info(f"OpenCode: {'configured' if OPENCODE_KEY else 'NOT CONFIGURED'}")
     uvicorn.run(app, host="0.0.0.0", port=port)
