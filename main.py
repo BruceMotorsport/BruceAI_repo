@@ -249,7 +249,8 @@ async def health():
         "qwen_pool": pool_status,
         "super_soldier": await supersoldier_status(),
         "openrouter_configured": bool(OPENROUTER_API_KEY),
-        "opencode_configured": bool(OPENCODE_KEY)
+        # Free Zen models need no key; what matters is that the CLI is installed.
+        "opencode_configured": bool(opencode_bin())
     }
 
 def dedupe_models(models: List[Model]) -> List[Model]:
@@ -381,10 +382,9 @@ async def call_openrouter(request: ChatCompletionRequest, authorization: Optiona
         return resp.json()
 
 async def call_opencode(request: ChatCompletionRequest):
-    if not OPENCODE_KEY:
-        raise HTTPException(500, "OpenCode key not configured")
-
-    # `opencode run -m` wants provider/model; picker ids are bare free-model ids.
+    # No key gate: the Zen free models answer without credentials, and the CLI
+    # owns its own auth (opencode auth login). Injecting an expired
+    # OPENCODE_API_KEY made every free model fail with "This API key has expired".
     model = request.model
     if model in ("opencode", "opencode-zen"):
         free = await opencode_free_models()
@@ -411,7 +411,7 @@ async def call_opencode(request: ChatCompletionRequest):
                 exe, "run", "-m", model, prompt,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "OPENCODE_API_KEY": OPENCODE_KEY}
+                env={k: v for k, v in os.environ.items() if k != "OPENCODE_API_KEY"}
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
         except asyncio.TimeoutError:
