@@ -286,19 +286,11 @@ async def list_models():
     if await supersoldier_available():
         models.append(Model(id="super-soldier", owned_by="bruceai"))
 
-    # OpenRouter models (common ones)
+    # OpenRouter models (live free ids only - paid ones are blocked below, and the
+    # 2024-era ids are delisted; verified against /api/v1/models on 2026-11-11)
     openrouter_models = [
-        "anthropic/claude-3.5-sonnet",
-        "anthropic/claude-3-opus",
-        "openai/gpt-4o",
-        "openai/gpt-4o-mini",
-        "google/gemini-pro-1.5",
-        "meta-llama/llama-3.1-405b",
-        "nvidia/nemotron-3-ultra",
-        "qwen/qwen-2.5-72b-instruct",
-        "nvidia/nemotron-3-super-120b-a12b:free",
+        "nvidia/nemotron-3.5-lightning:free",
         "nvidia/nemotron-3-ultra-550b-a55b:free",
-        "qwen/qwen3.8-27b:free",
         "google/gemma-4-31b-it:free",
     ]
     for m in openrouter_models:
