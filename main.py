@@ -110,6 +110,22 @@ MODEL_ROUTES = {
     # Everything else -> OpenRouter
     }
 
+# Free-tier Groq meters prompt + completion together, so a model's 131k window
+# does not mean a 35k-token agent turn can be sent there. These turns hop to
+# the pool instead of 413ing.
+GROQ_FREE_TPM = int(os.environ.get("GROQ_FREE_TPM", "8000"))
+GROQ_LONG_TURN_HOP = os.environ.get("GROQ_LONG_TURN_HOP", "1") == "1"
+GROQ_LONG_TURN_TARGET = os.environ.get("GROQ_LONG_TURN_TARGET", "qwen/qwen3.8-27b")
+LONG_TURN_MODELS = {"openai/gpt-oss-120b", "openai/gpt-oss-20b"}
+
+
+def estimate_payload_tokens(request: "ChatCompletionRequest") -> int:
+    """Rough prompt+output estimate; ~4 chars/token plus the tool catalog."""
+    chars = sum(len(_content_text(m.content)) for m in request.messages)
+    if request.tools:
+        chars += len(json.dumps(request.tools))
+    return chars // 4 + (request.max_tokens or 1024)
+
 class Model(BaseModel):
     id: str
     object: str = "model"
@@ -744,6 +760,22 @@ async def call_supersoldier(request: ChatCompletionRequest):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, authorization: Optional[str] = Header(None)):
     route = get_route(request.model)
+
+    # Groq's free tier meters prompt and completion together (~8k tokens/min on
+    # gpt-oss, 7k on qwen). An agent turn is larger than that before it starts,
+    # so the request 413s regardless of how big the model's window is. Send
+    # those turns to the pool, which reaches ModelScope and has room. Set
+    # GROQ_LONG_TURN_HOP=0 to disable, GROQ_LONG_TURN_TARGET to change target.
+    if (route == "groq" and GROQ_LONG_TURN_HOP and request.model in LONG_TURN_MODELS):
+        estimated = estimate_payload_tokens(request)
+        if estimated > GROQ_FREE_TPM:
+            logger.warning(
+                f"long turn for {request.model} (~{estimated} tokens > {GROQ_FREE_TPM} "
+                f"free TPM); serving via {GROQ_LONG_TURN_TARGET} on the pool"
+            )
+            request = request.model_copy(update={"model": GROQ_LONG_TURN_TARGET})
+            route = "pool"
+
     logger.info(f"Routing {request.model} -> {route}")
     
     if route == "groq":
