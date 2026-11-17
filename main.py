@@ -499,7 +499,10 @@ async def call_openrouter(request: ChatCompletionRequest, authorization: Optiona
             raise HTTPException(resp.status_code, resp.text)
         return resp.json()
 
-OPENCODE_PROMPT_LIMIT = 20000  # Windows caps a command line at 32k chars
+# The prompt is sent on stdin (the CLI reads it when no positional message is
+# given), so this is no longer bound by the 32k Windows command-line cap. It is
+# only a safety rail; the real limit is the model's own context window.
+OPENCODE_PROMPT_LIMIT = 400000
 
 
 def _content_text(value: Any) -> str:
@@ -523,9 +526,9 @@ def _content_text(value: Any) -> str:
 def build_opencode_prompt(messages, limit: int = OPENCODE_PROMPT_LIMIT) -> str:
     """Serialise a conversation for `opencode run`, keeping the newest turn.
 
-    The CLI takes the whole conversation as one argv string, so it has to fit in
-    a budget. The previous code concatenated everything and then cut the tail
-    with `prompt[:20000]`. Qoder's agent system prompt alone is ~35k chars, so
+    The prompt is piped in on stdin, but it still has to be bounded: the model
+    behind the CLI has its own window. Previously the budget was 20k chars cut
+    from the tail, and Qoder's agent system prompt alone is ~35-43k chars, so
     that cut deleted the user's message every turn: the model saw only a
     persona and answered with a greeting ("Ready. What would you like to work
     on?"), which Qoder recorded as an empty turn. Reserve the newest turns
@@ -605,12 +608,14 @@ async def call_opencode(request: ChatCompletionRequest):
     for attempt in (1, 2):
         try:
             proc = await asyncio.create_subprocess_exec(
-                exe, "run", "-m", model, prompt,
+                exe, "run", "-m", model,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env={k: v for k, v in os.environ.items() if k != "OPENCODE_API_KEY"}
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(prompt.encode("utf-8")), timeout=180)
         except asyncio.TimeoutError:
             try:
                 proc.kill()
