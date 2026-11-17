@@ -6,6 +6,7 @@ Standalone version - no external dependencies
 """
 import os
 import json
+import re
 import time
 import logging
 import shutil
@@ -52,15 +53,20 @@ SUPER_SOLDIER_TASK_LIMIT = int(os.getenv("SUPER_SOLDIER_TASK_LIMIT", "10000"))
 # set of ids `opencode run -m` accepts.
 OPENCODE_FREE_TTL = int(os.getenv("OPENCODE_FREE_TTL", "600"))
 OPENCODE_FREE_FALLBACK = [
-    "ling-3.0-flash-fin-free",
-    "longcat-2.5-preview-free",
+    "beam-free",
+    "deepseek-v4.1-flash-free",
+    "flint-40b-free",
+    "glm-5.3-flash-free",
+    "hy4-flash-free",
+    "iceman-free",
+    "inkling-2-small-free",
+    "longcat-2.5-free",
     "mimo-v2.6-flash-free",
-    "muse-spark-1.3-contributor-free",
-    "nemotron-3-ultra-free",
     "nemotron-3.5-lightning-free",
-    "space-bunny-free",
+    "nemotron-3.5-super-vl-free",
 ]
 _opencode_free_state = {"ids": list(OPENCODE_FREE_FALLBACK), "at": 0.0}
+_opencode_catalog_state = {"ids": [], "at": 0.0}
 _OPENCODE_BIN: Optional[str] = None
 
 def opencode_bin() -> Optional[str]:
@@ -157,15 +163,50 @@ async def discover_opencode_free_models() -> List[str]:
         ids: List[str] = []
         for line in stdout.decode("utf-8", "replace").splitlines():
             mid = line.strip()
-            if mid.endswith("-free") and "/" in mid:
-                bare = mid.split("/", 1)[1]
-                if bare not in ids:
-                    ids.append(bare)
+            # Only the CLI's own free provider. The catalog also carries
+            # opencode-go/* (paid) and stale bruceai/* entries left over from an
+            # old local provider; advertising those produced ids like
+            # "opencode/iceman-contributor-free" that do not exist, so the CLI
+            # answered "Unexpected server error" and Qoder showed
+            # "Internal Server Error".
+            provider, sep, bare = mid.partition("/")
+            if not sep or provider != "opencode" or not bare.endswith("-free"):
+                continue
+            if bare not in ids:
+                ids.append(bare)
         if ids:
             return ids
     except Exception:
         pass
     return []
+
+async def opencode_catalog() -> List[str]:
+    """Every model id the CLI currently accepts, cached like the free list.
+    Used to reject stale picker entries with a clear 404 instead of letting the
+    CLI fail with an opaque 500."""
+    now = time.time()
+    if now - float(_opencode_catalog_state["at"]) <= OPENCODE_FREE_TTL:
+        return list(_opencode_catalog_state["ids"])
+    exe = opencode_bin()
+    ids: List[str] = []
+    if exe:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                exe, "models",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
+            for line in stdout.decode("utf-8", "replace").splitlines():
+                mid = line.strip()
+                if "/" in mid and mid not in ids:
+                    ids.append(mid)
+        except Exception:
+            ids = []
+    if ids:
+        _opencode_catalog_state["ids"] = ids
+    _opencode_catalog_state["at"] = now
+    return list(_opencode_catalog_state["ids"])
 
 async def opencode_free_models() -> List[str]:
     now = time.time()
@@ -176,6 +217,49 @@ async def opencode_free_models() -> List[str]:
         _opencode_free_state["at"] = now
     return list(_opencode_free_state["ids"])
 
+OPENROUTER_FREE_TTL = int(os.getenv("OPENROUTER_FREE_TTL", "600"))
+# Seed only: used until the first live OpenRouter fetch succeeds (or when no
+# OPENROUTER_API_KEY is present). The live list is authoritative.
+OPENROUTER_FREE_FALLBACK = [
+    "nvidia/nemotron-3.5-lightning:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "google/gemma-4-31b-it:free",
+]
+_openrouter_free_state = {"ids": list(OPENROUTER_FREE_FALLBACK), "at": 0.0}
+
+async def discover_openrouter_free_models() -> List[str]:
+    """Every live `:free` id on OpenRouter, read from the API so the picker
+    shows the complete free set the free-models-only policy can actually serve,
+    instead of a hand-picked subset. `:free` is the marker call_openrouter
+    gates on, so this list is exactly what stays unbilled."""
+    if not OPENROUTER_API_KEY:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{OPENROUTER_BASE_URL}/models",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+            )
+        if resp.status_code != 200:
+            return []
+        ids: List[str] = []
+        for m in resp.json().get("data", []):
+            mid = str(m.get("id", ""))
+            if mid.endswith(":free") and mid not in ids:
+                ids.append(mid)
+        return ids
+    except Exception:
+        return []
+
+async def openrouter_free_models() -> List[str]:
+    now = time.time()
+    if now - float(_openrouter_free_state["at"]) > OPENROUTER_FREE_TTL:
+        ids = await discover_openrouter_free_models()
+        if ids:
+            _openrouter_free_state["ids"] = ids
+        _openrouter_free_state["at"] = now
+    return list(_openrouter_free_state["ids"])
+
 def get_route(model: str) -> str:
     """Determine which backend to route to"""
     if model in MODEL_ROUTES:
@@ -183,6 +267,43 @@ def get_route(model: str) -> str:
     if model.endswith("-free") or model.startswith(("opencode/", "opencode-go/")):
         return "opencode"
     return "openrouter"
+
+def sanitize_json_schema(node: Any) -> bool:
+    """Normalise JSON Schema constructs that strict providers reject.
+
+    Qoder's built-in tool catalog contains at least one enum with repeated
+    values. Cohere (reached through OpenRouter) rejects the whole request with
+    "invalid 'parameters' provided: enum items must be unique", so every turn on
+    a custom model died with a 400. Dedupe enums (order preserved) anywhere in a
+    tool schema before forwarding. Returns True when something changed.
+    """
+    changed = False
+    if isinstance(node, dict):
+        for key, value in list(node.items()):
+            if key == "enum" and isinstance(value, list):
+                seen: List[Any] = []
+                for item in value:
+                    if item not in seen:
+                        seen.append(item)
+                if len(seen) != len(value):
+                    node[key] = seen
+                    changed = True
+            elif sanitize_json_schema(value):
+                changed = True
+    elif isinstance(node, list):
+        for item in node:
+            if sanitize_json_schema(item):
+                changed = True
+    return changed
+
+def normalize_tool_schemas(payload: Dict[str, Any], model: str) -> None:
+    for key in ("tools", "functions"):
+        if isinstance(payload.get(key), list) and sanitize_json_schema(payload[key]):
+            logger.warning(f"Sanitised duplicate enum values in {key} for {model}")
+
+def strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+
 
 # Super-Soldier is an unfinished side project. It is only advertised and
 # routed while its own gateway is answering, so a half-built service can never
@@ -287,14 +408,9 @@ async def list_models():
     if await supersoldier_available():
         models.append(Model(id="super-soldier", owned_by="bruceai"))
 
-    # OpenRouter models (live free ids only - paid ones are blocked below, and the
-    # 2024-era ids are delisted; verified against /api/v1/models on 2026-11-11)
-    openrouter_models = [
-        "nvidia/nemotron-3.5-lightning:free",
-        "nvidia/nemotron-3-ultra-550b-a55b:free",
-        "google/gemma-4-31b-it:free",
-    ]
-    for m in openrouter_models:
+    # OpenRouter free models (live `:free` ids only - the free-models-only policy
+    # in call_openrouter blocks anything else, so this is exactly the unbilled set)
+    for m in await openrouter_free_models():
         models.append(Model(id=m, owned_by="openrouter"))
     
     return ModelsResponse(data=dedupe_models(models))
@@ -311,6 +427,7 @@ async def call_groq_bridge(request: ChatCompletionRequest, authorization: Option
         if isinstance(_m, dict):
             for _k in ("reasoning_details", "reasoning", "reasoning_content", "reasoning_tokens"):
                 _m.pop(_k, None)
+    normalize_tool_schemas(payload, request.model)
     payload["stream"] = request.stream
     if request.max_tokens:
         payload["max_tokens"] = request.max_tokens
@@ -357,6 +474,7 @@ async def call_openrouter(request: ChatCompletionRequest, authorization: Optiona
     }
     
     payload = request.model_dump(exclude_none=True)
+    normalize_tool_schemas(payload, request.model)
     payload["stream"] = request.stream
     if request.max_tokens:
         payload["max_tokens"] = request.max_tokens
@@ -392,6 +510,19 @@ async def call_opencode(request: ChatCompletionRequest):
     elif "/" not in model:
         model = f"opencode/{model}"
 
+    # Reject stale picker entries (e.g. bruceai/* leftovers from an old local
+    # provider) before spawning the CLI. Without this the CLI exits non-zero on
+    # an id it does not know and the console used to answer 500, which Qoder
+    # surfaces as "Internal Server Error".
+    catalog = await opencode_catalog()
+    if catalog and model not in catalog:
+        free = await opencode_free_models()
+        raise HTTPException(
+            404,
+            f"'{request.model}' is not in the current OpenCode catalog "
+            f"(stale BYOK entry). Available free ids: {', '.join(free)}",
+        )
+
     prompt = "\n".join([f"{m.role}: {m.content}" for m in request.messages if m.content is not None])
     if len(prompt) > 20000:
         prompt = prompt[:20000]
@@ -424,7 +555,8 @@ async def call_opencode(request: ChatCompletionRequest):
             raise HTTPException(500, "OpenCode CLI not installed")
 
         if proc.returncode != 0:
-            raise HTTPException(500, f"OpenCode error ({model}): {stderr.decode('utf-8', 'replace')[:400]}")
+            detail = strip_ansi(stderr.decode("utf-8", "replace")).replace("\n", " ")[:400]
+            raise HTTPException(502, f"OpenCode upstream failed for {model}: {detail}")
 
         content = stdout.decode("utf-8", "replace").strip()
         if content:
@@ -566,6 +698,8 @@ async def chat_completions(request: ChatCompletionRequest, authorization: Option
 async def warm_opencode_free_models():
     ids = await opencode_free_models()
     logger.info(f"OpenCode free models ({len(ids)}): {', '.join(ids)}")
+    or_ids = await openrouter_free_models()
+    logger.info(f"OpenRouter free models ({len(or_ids)}): {', '.join(or_ids)}")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 9001))
