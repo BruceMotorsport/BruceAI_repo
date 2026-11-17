@@ -499,6 +499,74 @@ async def call_openrouter(request: ChatCompletionRequest, authorization: Optiona
             raise HTTPException(resp.status_code, resp.text)
         return resp.json()
 
+OPENCODE_PROMPT_LIMIT = 20000  # Windows caps a command line at 32k chars
+
+
+def _content_text(value: Any) -> str:
+    """Flatten OpenAI message content (string or content-block list) to text."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: List[str] = []
+        for block in value:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") in (None, "text", "input_text", "output_text"):
+                    parts.append(str(block.get("text") or block.get("content") or ""))
+        return "\n".join(p for p in parts if p)
+    return str(value)
+
+
+def build_opencode_prompt(messages, limit: int = OPENCODE_PROMPT_LIMIT) -> str:
+    """Serialise a conversation for `opencode run`, keeping the newest turn.
+
+    The CLI takes the whole conversation as one argv string, so it has to fit in
+    a budget. The previous code concatenated everything and then cut the tail
+    with `prompt[:20000]`. Qoder's agent system prompt alone is ~35k chars, so
+    that cut deleted the user's message every turn: the model saw only a
+    persona and answered with a greeting ("Ready. What would you like to work
+    on?"), which Qoder recorded as an empty turn. Reserve the newest turns
+    first, then give whatever space is left to the system prompt.
+    """
+    system_parts: List[str] = []
+    turns: List[tuple] = []
+    for message in messages:
+        text = _content_text(message.content).strip()
+        if not text:
+            continue
+        if message.role == "system":
+            system_parts.append(text)
+        else:
+            turns.append((message.role, text))
+
+    selected: List[str] = []
+    used = 0
+    for role, text in reversed(turns):          # newest first: current turn survives
+        room = limit - used
+        if room <= len(role) + 3:
+            break
+        line = f"{role}: {text}"[:room]
+        selected.append(line)
+        used += len(line) + 1
+        if used >= limit:
+            break
+    selected.reverse()
+
+    prompt = "\n".join(selected)
+    system_text = "\n\n".join(system_parts)
+    prefix = "system: "
+    room = limit - len(prompt) - len(prefix) - (2 if prompt else 0)
+    if system_text and room > 40:
+        if len(system_text) > room:
+            marker = "\n[...system prompt truncated...]"
+            system_text = system_text[:max(0, room - len(marker))].rstrip() + marker
+        prompt = prefix + system_text + ("\n\n" + prompt if prompt else "")
+    return prompt[:limit]
+
+
 async def call_opencode(request: ChatCompletionRequest):
     # No key gate: the Zen free models answer without credentials, and the CLI
     # owns its own auth (opencode auth login). Injecting an expired
@@ -523,9 +591,7 @@ async def call_opencode(request: ChatCompletionRequest):
             f"(stale BYOK entry). Available free ids: {', '.join(free)}",
         )
 
-    prompt = "\n".join([f"{m.role}: {m.content}" for m in request.messages if m.content is not None])
-    if len(prompt) > 20000:
-        prompt = prompt[:20000]
+    prompt = build_opencode_prompt(request.messages)
 
     exe = opencode_bin()
     if not exe:
