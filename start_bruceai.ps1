@@ -332,7 +332,7 @@ function Wait-Healthy {
 
 function Invoke-SmokeTest {
     $body = @{
-        model     = 'openai/gpt-oss-20b'
+        model     = 'openai/gpt-oss-120b'
         messages  = @(@{ role = 'user'; content = 'ping' })
         max_tokens = 1
         stream    = $false
@@ -429,11 +429,15 @@ function Start-BruceStack {
         if (-not $ch.opencode_configured) { Write-Log 'OPENCODE key not active in the console - opencode models will fail.' 'WARN' }
 
         $cm = Get-Json "$script:ConsoleUrl/v1/models"
-        if (-not $cm -or $cm.data.Count -lt 9) {
-            Write-Log "Console serves $(if ($cm) { $cm.data.Count } else { 0 }) models (expected >= 9)" 'ERROR'
+        $modelCount = if ($cm -and $cm.data) { $cm.data.Count } else { 0 }
+        if ($modelCount -lt 1) {
+            Write-Log 'Console serves no models - every chat request will fail.' 'ERROR'
             return $false
         }
-        Write-Log "OK: Provider Console healthy on :$ConsolePort, groq_bridge=$($ch.groq_bridge), models=$($cm.data.Count)"
+        if ($modelCount -lt 9) {
+            Write-Log "Console serves $modelCount models; a fully-keyed machine exposes 9+ (missing provider keys were logged above)." 'WARN'
+        }
+        Write-Log "OK: Provider Console healthy on :$ConsolePort, groq_bridge=$($ch.groq_bridge), models=$modelCount"
 
         if ($SmokeTest) {
             if (-not (Invoke-SmokeTest)) { return $false }

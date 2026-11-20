@@ -1,19 +1,19 @@
 # Secrets stay local - never committed
 .env
-.env.*
-groq_keys.txt
 
 # Vendored side project - not part of the server
 deerflow/
 
+# Nested repo - each has its own git, not needed in BruceAI
+UsersUSERbrag-repo/
+
 # Runtime output
 logs/
+benchmarks/results/
 __pycache__/
 *.pyc
-pool_cache.db
 
-# Local answer library (contains conversation text)
-state/
-
-# Nested clone used for publishing
-bruceai_repo/
+# Groq pool account keys - never commit
+groq_keys.txt
+opencode_server.txt
+opencode_server_password.txt

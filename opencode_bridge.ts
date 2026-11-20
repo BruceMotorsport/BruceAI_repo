@@ -28,15 +28,18 @@ const MAX_TOKENS_CAP = 32000
 const REQUEST_TIMEOUT_MS = Number(process.env.OPENCODE_UPSTREAM_TIMEOUT_MS ?? "180000")
 
 const FREE_MODELS = [
+  "big-pickle",
+  "iceman-free",
+  "inkling-2-small-free",
+  "glm-5.3-flash-free",
+  "deepseek-v4.1-flash-free",
   "beam-free",
-  "nemotron-3.5-lightning-free",
+  "flint-40b-free",
+  "longcat-2.5-free",
+  "hy4-flash-free",
   "mimo-v2.6-flash-free",
-  "nemotron-3-ultra-free",
-  "mimo-v2-free",
-  "ling-3.0-flash-free",
-  "glm-5-free",
-  "kimi-k2.5-free",
-  "space-bunny-free",
+  "nemotron-3.5-lightning-free",
+  "nemotron-3.5-super-vl-free",
 ]
 
 const SIG_PATH = new URL("./opencode_signature.txt", import.meta.url)
